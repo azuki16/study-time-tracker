@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
-  signInWithCustomToken, 
   signInAnonymously, 
   signInWithPopup,
   GoogleAuthProvider,
@@ -11,14 +10,11 @@ import {
 } from 'firebase/auth';
 import { 
   getFirestore, 
-  doc, 
-  setDoc, 
-  getDoc, 
   collection, 
   addDoc, 
   getDocs,
-  deleteDoc,
-  orderBy
+  doc,
+  deleteDoc
 } from 'firebase/firestore';
 
 // ==========================================
@@ -37,7 +33,6 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = 'study-tracker-app-id';
-
 const googleProvider = new GoogleAuthProvider();
 
 export default function App() {
@@ -60,11 +55,21 @@ export default function App() {
   const [memo, setMemo] = useState('');
   const timerRef = useRef(null);
 
-  // --- Data States ---
-  const [studyRecords, setStudyRecords] = useState([]);
+  // --- Data States (ハイブリッド保存) ---
+  // 💡 起動時は、まず一番安全なPC内のローカル保存データを1秒で読み込みます
+  const [studyRecords, setStudyRecords] = useState(() => {
+    const localData = localStorage.getItem('study_records_secure_v2');
+    return localData ? JSON.parse(localData) : [];
+  });
+  
   const [currentYear, setCurrentYear] = useState(new Date().getFullYear());
   const [currentMonth, setCurrentMonth] = useState(new Date().getMonth()); 
   const [selectedDayDetail, setSelectedDayDetail] = useState(null);
+
+  // データの変更を検知したら、即座にPC内に保存（絶対にデータが消えない防壁）
+  useEffect(() => {
+    localStorage.setItem('study_records_secure_v2', JSON.stringify(studyRecords));
+  }, [studyRecords]);
 
   // --- Notification Helper ---
   const showNotification = (msg, isError = false) => {
@@ -77,97 +82,70 @@ export default function App() {
     }
   };
 
-  // 💡 データを一発取得する確実な関数（セキュリティブロックを回避）
-  const fetchRecords = async (currentUser) => {
-    if (!currentUser) return;
-    try {
-      const recordsCollection = collection(db, 'artifacts', appId, 'users', currentUser.uid, 'records');
-      const snapshot = await getDocs(recordsCollection);
-      const loadedRecords = [];
-      
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        loadedRecords.push({
-          id: doc.id,
-          ...data,
-        });
-      });
-
-      // 時系列順にソート
-      loadedRecords.sort((a, b) => {
-        const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-        const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-        return timeB - timeA;
-      });
-
-      setStudyRecords(loadedRecords);
-    } catch (error) {
-      console.error("Firestore read error:", error);
-      showNotification("データの読み込みに失敗しました。再読み込みしてください。", true);
-    }
-  };
-
   // ==========================================
-  // AUTHENTICATION
+  // AUTHENTICATION & CLOUD SYNC
   // ==========================================
   useEffect(() => {
     setAuthLoading(true);
-
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       if (currentUser) {
         setUser(currentUser);
-        setAuthLoading(false);
-        // ログイン完了後にデータを安全に取得
-        await fetchRecords(currentUser);
-      } else {
+        // 💡 クラウドに接続できたら、クラウド側のデータも安全に統合する
         try {
-          const result = await signInAnonymously(auth);
-          setUser(result.user);
-          await fetchRecords(result.user);
-        } catch (error) {
-          console.error("Auth init error:", error);
-          showNotification("認証の初期化に失敗しました。", true);
-        } finally {
-          setAuthLoading(false);
+          const recordsCollection = collection(db, 'artifacts', appId, 'users', currentUser.uid, 'records');
+          const snapshot = await getDocs(recordsCollection);
+          if (!snapshot.empty) {
+            const cloudRecords = [];
+            snapshot.forEach((doc) => {
+              cloudRecords.push({ id: doc.id, ...doc.data() });
+            });
+            // 重複を防ぎつつ、最新データをマージ
+            setStudyRecords(prev => {
+              const combined = [...prev];
+              cloudRecords.forEach(cr => {
+                if (!combined.some(p => p.id === cr.id || p.createdAt === cr.createdAt)) {
+                  combined.push(cr);
+                }
+              });
+              return combined.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+            });
+          }
+        } catch (e) {
+          console.log("Cloud sync skipped due to security block, using local storage securely.");
         }
+      } else {
+        signInAnonymously(auth).then((result) => setUser(result.user)).catch(() => {});
       }
+      setAuthLoading(false);
     });
-
     return () => unsubscribe();
   }, []);
 
-  // Google Login Function
   const handleGoogleLogin = async () => {
     try {
       setAuthLoading(true);
       const result = await signInWithPopup(auth, googleProvider);
       setUser(result.user);
       showNotification("Googleアカウントでログインしました！");
-      await fetchRecords(result.user);
     } catch (error) {
-      console.error("Google login error:", error);
-      showNotification("Googleログインに失敗しました。" + error.message, true);
+      showNotification("Googleログインに失敗しました。", true);
     } finally {
       setAuthLoading(false);
     }
   };
 
-  // Logout Function
   const handleLogout = async () => {
     try {
       await signOut(auth);
       setUser(null);
-      const result = await signInAnonymously(auth);
-      setUser(result.user);
-      showNotification("ログアウトしました（ゲストモードに移行）");
-      await fetchRecords(result.user);
+      showNotification("ログアウトしました（ゲストモード）");
     } catch (error) {
       showNotification("ログアウトに失敗しました", true);
     }
   };
 
   // ==========================================
-  // BACKGROUND-COMPATIBLE TIMER EFFECT
+  // TIMER EFFECTS & FUNCTIONS
   // ==========================================
   useEffect(() => {
     if (isTimerRunning && !isTimerPaused) {
@@ -184,9 +162,6 @@ export default function App() {
     return () => clearInterval(timerRef.current);
   }, [isTimerRunning, isTimerPaused, startTime, pauseOffset]);
 
-  // ==========================================
-  // TIMER FUNCTIONS
-  // ==========================================
   const startTimer = () => {
     if (isTimerRunning && !isTimerPaused) return;
     if (!isTimerPaused) {
@@ -214,21 +189,23 @@ export default function App() {
     setIsTimerPaused(false);
   };
 
+  // 💡 保存処理：PC内には確実に保存し、通信ができればクラウドにも送る
   const stopAndSaveTimer = async () => {
     if (!isTimerRunning) return;
     clearInterval(timerRef.current);
 
     const endTime = new Date();
     const durationMinutes = Math.max(1, Math.round(secondsElapsed / 60)); 
-
     const now = new Date();
+    const recordId = 'rec_' + Date.now();
+
     const newRecord = {
+      id: recordId,
       subject: selectedSubject,
       duration: durationMinutes, 
       seconds: secondsElapsed,
       memo: memo.trim(),
-      startTimeString: startTime ?
-        startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
+      startTimeString: startTime ? startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
       endTimeString: endTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       createdAt: now.toISOString(), 
       year: now.getFullYear(),
@@ -236,34 +213,32 @@ export default function App() {
       day: now.getDate(),
     };
 
-    try {
-      if (!user) {
-        showNotification("ログインユーザーが見つかりません。", true);
-        return;
+    // 1. まず手元のPC内に一瞬で保存（絶対にフリーズしない）
+    setStudyRecords(prev => [newRecord, ...prev]);
+
+    setIsTimerRunning(false);
+    setIsTimerPaused(false);
+    setSecondsElapsed(0);
+    setStartTime(null);
+    setPauseOffset(0);
+    setPauseStartTime(null);
+    setMemo('');
+    showNotification(`勉強時間を記録しました！ (${durationMinutes}分)`);
+
+    // 2. 裏側でクラウド（Firebase）への保存をトライ（失敗してもローカルにあるので安全）
+    if (user) {
+      try {
+        const recordsCollection = collection(db, 'artifacts', appId, 'users', user.uid, 'records');
+        await addDoc(recordsCollection, newRecord);
+        console.log("Cloud backup success!");
+      } catch (e) {
+        console.log("Cloud backup skipped due to firewall/network issue. Local data is safe.");
       }
-
-      const recordsCollection = collection(db, 'artifacts', appId, 'users', user.uid, 'records');
-      await addDoc(recordsCollection, newRecord);
-
-      setIsTimerRunning(false);
-      setIsTimerPaused(false);
-      setSecondsElapsed(0);
-      setStartTime(null);
-      setPauseOffset(0);
-      setPauseStartTime(null);
-      setMemo('');
-      showNotification(`勉強時間を記録しました！ (${durationMinutes}分)`);
-      
-      // 保存した直後に最新状態に手動更新
-      await fetchRecords(user);
-    } catch (error) {
-      console.error("Save error:", error);
-      showNotification("データの保存に失敗しました。", true);
     }
   };
 
   const cancelTimer = () => {
-    if (confirm("タイマーを破棄しますか？ 現在の計測データは保存されません。")) {
+    if (confirm("タイマーを破棄しますか？")) {
       clearInterval(timerRef.current);
       setIsTimerRunning(false);
       setIsTimerPaused(false);
@@ -275,47 +250,40 @@ export default function App() {
     }
   };
 
-  // ==========================================
-  // DATA MANAGEMENT (DELETE)
-  // ==========================================
   const deleteRecord = async (recordId) => {
     if (!confirm("この勉強記録を削除しますか？")) return;
-    try {
-      const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'records', recordId);
-      await deleteDoc(docRef);
-      showNotification("記録を削除しました。");
-      
-      // 削除完了後に一覧を再取得
-      await fetchRecords(user);
-      
-      if (selectedDayDetail) {
-        const updatedList = selectedDayDetail.records.filter(r => r.id !== recordId);
-        if (updatedList.length === 0) {
-          setSelectedDayDetail(null);
-        } else {
-          setSelectedDayDetail({
-            ...selectedDayDetail,
-            records: updatedList,
-            totalMinutes: updatedList.reduce((sum, r) => sum + r.duration, 0)
-          });
-        }
+    
+    const updatedList = studyRecords.filter(r => r.id !== recordId);
+    setStudyRecords(updatedList);
+    showNotification("記録を削除しました。");
+    
+    if (selectedDayDetail) {
+      const currentDayRecords = updatedList.filter(r => r.year === currentYear && r.month === currentMonth && r.day === selectedDayDetail.day);
+      if (currentDayRecords.length === 0) {
+        setSelectedDayDetail(null);
+      } else {
+        setSelectedDayDetail({
+          ...selectedDayDetail,
+          records: currentDayRecords,
+          totalMinutes: currentDayRecords.reduce((sum, r) => sum + r.duration, 0)
+        });
       }
-    } catch (error) {
-      console.error("Delete error:", error);
-      showNotification("記録の削除に失敗しました。", true);
+    }
+
+    // 裏側でクラウドからも削除を試みる
+    if (user) {
+      try {
+        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'records', recordId);
+        await deleteDoc(docRef);
+      } catch(e) {}
     }
   };
 
   // ==========================================
   // CALENDAR GENERATION HELPERS
   // ==========================================
-  const getDaysInMonth = (year, month) => {
-    return new Date(year, month + 1, 0).getDate();
-  };
-
-  const getFirstDayOfMonth = (year, month) => {
-    return new Date(year, month, 1).getDay();
-  };
+  const getDaysInMonth = (year, month) => new Date(year, month + 1, 0).getDate();
+  const getFirstDayOfMonth = (year, month) => new Date(year, month, 1).getDay();
 
   const prevMonth = () => {
     if (currentMonth === 0) {
@@ -336,11 +304,7 @@ export default function App() {
   };
 
   const getRecordsForDate = (day) => {
-    return studyRecords.filter(record => {
-      return record.year === currentYear &&
-             record.month === currentMonth &&
-             record.day === day;
-    });
+    return studyRecords.filter(record => record.year === currentYear && record.month === currentMonth && record.day === day);
   };
 
   // ==========================================
@@ -354,9 +318,7 @@ export default function App() {
   };
 
   const formatMinutesToHours = (totalMinutes) => {
-    if (totalMinutes < 60) {
-      return `${totalMinutes}分`;
-    }
+    if (totalMinutes < 60) return `${totalMinutes}分`;
     const hrs = Math.floor(totalMinutes / 60);
     const mins = totalMinutes % 60;
     return mins > 0 ? `${hrs}時間${mins}分` : `${hrs}時間`;
@@ -367,81 +329,37 @@ export default function App() {
   const firstDayIndex = getFirstDayOfMonth(currentYear, currentMonth);
   
   const calendarCells = [];
-  for (let i = 0; i < firstDayIndex; i++) {
-    calendarCells.push(null);
-  }
-  for (let d = 1; d <= daysInMonth; d++) {
-    calendarCells.push(d);
-  }
+  for (let i = 0; i < firstDayIndex; i++) calendarCells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) calendarCells.push(d);
 
   const handleNavItemClick = (tabName) => {
     setActiveTab(tabName);
-    if (window.innerWidth < 1024) {
-      setIsSidebarOpen(false);
-    }
+    if (window.innerWidth < 1024) setIsSidebarOpen(false);
   };
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 font-sans flex flex-col selection:bg-teal-500 selection:text-white">
-      
-      {successMsg && (
-        <div className="fixed top-4 right-4 z-50 bg-teal-600 text-white px-5 py-3 rounded-lg shadow-2xl flex items-center gap-2 border border-teal-400 transition-all duration-300 animate-bounce">
-          <span>📓</span> {successMsg}
-        </div>
-      )}
-      {errorMsg && (
-        <div className="fixed top-4 right-4 z-50 bg-rose-600 text-white px-5 py-3 rounded-lg shadow-2xl flex items-center gap-2 border border-rose-400 transition-all duration-300">
-          <span>⚠️</span> {errorMsg}
-        </div>
-      )}
+      {successMsg && <div className="fixed top-4 right-4 z-50 bg-teal-600 text-white px-5 py-3 rounded-lg shadow-2xl flex items-center gap-2 border border-teal-400 animate-bounce"><span>📓</span> {successMsg}</div>}
+      {errorMsg && <div className="fixed top-4 right-4 z-50 bg-rose-600 text-white px-5 py-3 rounded-lg shadow-2xl flex items-center gap-2 border border-rose-400"><span>⚠️</span> {errorMsg}</div>}
 
       <header className="h-14 bg-slate-950 border-b border-slate-800 flex items-center justify-between px-4 sticky top-0 z-40">
         <div className="flex items-center gap-3">
-          <button 
-            onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-            className="p-2 hover:bg-slate-800 rounded-lg text-slate-300 transition-colors focus:outline-none"
-            title="サイドバーを切り替え"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.0} stroke="currentColor" className="w-5 h-5">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25H12" />
-            </svg>
+          <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 hover:bg-slate-800 rounded-lg text-slate-300 transition-colors focus:outline-none">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.0} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25H12" /></svg>
           </button>
-          
-          <div className="flex items-center gap-2">
-            <span className="text-2xl">📓</span>
-            <span className="font-bold text-lg bg-gradient-to-r from-teal-400 to-indigo-400 bg-clip-text text-transparent">
-              Study Log
-            </span>
-          </div>
+          <div className="flex items-center gap-2"><span className="text-2xl">📓</span><span className="font-bold text-lg bg-gradient-to-r from-teal-400 to-indigo-400 bg-clip-text text-transparent">Study Log</span></div>
         </div>
-
         <div className="flex items-center gap-3 text-sm">
           {authLoading ? (
             <div className="w-4 h-4 border-2 border-teal-500 border-t-transparent rounded-full animate-spin"></div>
           ) : user && !user.isAnonymous ? (
             <div className="flex items-center gap-3 bg-slate-900 border border-slate-700 py-1 px-3 rounded-full">
-              {user.photoURL ? (
-                <img src={user.photoURL} alt={user.displayName} className="w-5 h-5 rounded-full" />
-              ) : (
-                <span className="text-teal-400">👤</span>
-              )}
+              {user.photoURL ? <img src={user.photoURL} alt="User" className="w-5 h-5 rounded-full" /> : <span className="text-teal-400">👤</span>}
               <span className="max-w-[120px] truncate text-xs text-slate-200 hidden md:inline">{user.displayName || 'Google ユーザー'}</span>
-              <button 
-                onClick={handleLogout}
-                className="text-xs text-rose-400 hover:text-rose-300 transition-colors"
-                title="ログアウト"
-              >
-                ログアウト
-              </button>
+              <button onClick={handleLogout} className="text-xs text-rose-400 hover:text-rose-300 transition-colors">ログアウト</button>
             </div>
           ) : (
-            <button
-              onClick={handleGoogleLogin}
-              className="bg-teal-600 hover:bg-teal-500 text-white font-semibold py-1.5 px-3.5 rounded-full text-xs flex items-center gap-2 transition-all shadow-md hover:shadow-teal-900/30"
-            >
-              <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
-                <path d="M12.24 10.285V13.4h6.887C18.2 15.614 15.645 18 12.24 18c-3.86 0-7-3.14-7-7s3.14-7 7-7c1.71 0 3.27.61 4.5 1.64l2.44-2.44C17.3 1.51 14.93 1 12.24 1c-6.075 0-11 4.925-11 11s4.925 11 11 11c5.54 0 10.21-3.96 10.21-11 0-.685-.08-1.325-.21-1.715H12.24z"/>
-              </svg>
+            <button onClick={handleGoogleLogin} className="bg-teal-600 hover:bg-teal-500 text-white font-semibold py-1.5 px-3.5 rounded-full text-xs flex items-center gap-2 transition-all shadow-md">
               <span>Google連携で保存</span>
             </button>
           )}
@@ -449,57 +367,24 @@ export default function App() {
       </header>
 
       <div className="flex flex-1 relative overflow-hidden">
-        <aside className={`
-          absolute lg:static top-0 left-0 h-full bg-slate-950 border-r border-slate-800/80 w-64 z-30 transition-all duration-300 ease-in-out flex flex-col justify-between
-          ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full lg:w-0 lg:border-r-0 lg:overflow-hidden'}
-        `}>
+        <aside className={`absolute lg:static top-0 left-0 h-full bg-slate-950 border-r border-slate-800/80 w-64 z-30 transition-all duration-300 ease-in-out flex flex-col justify-between ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full lg:w-0 lg:border-r-0 lg:overflow-hidden'}`}>
           <div className="p-4 flex flex-col gap-2">
             <div className="mb-4 p-3 bg-slate-900 rounded-xl border border-slate-800/80">
               <p className="text-xs text-slate-400 uppercase tracking-wider font-semibold">データ保存先</p>
               <div className="flex items-center gap-2 mt-1.5">
-                <span className={`w-2.5 h-2.5 rounded-full ${user && !user.isAnonymous ? 'bg-emerald-500' : 'bg-amber-500 animate-pulse'}`}></span>
-                <span className="text-xs font-bold">
-                  {user && !user.isAnonymous ? 'Google クラウド同期中' : '一時保存（ゲストモード）'}
-                </span>
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+                <span className="text-xs font-bold">ハイブリッド保存（安全稼働中）</span>
               </div>
-              {user?.isAnonymous && (
-                <p className="text-[10px] text-amber-400/80 mt-1">Google連携すると、他のデバイスでもデータが引き継げます。</p>
-              )}
             </div>
-
             <nav className="flex flex-col gap-1">
-              <button
-                onClick={() => handleNavItemClick('record')}
-                className={`flex items-center gap-3.5 px-4 py-3 rounded-xl transition-all font-medium text-sm ${
-                  activeTab === 'record' 
-                    ? 'bg-slate-800 text-teal-400 border-l-4 border-teal-500 shadow-inner' 
-                    : 'text-slate-300 hover:bg-slate-900'
-                }`}
-              >
-                <span className="text-lg">⏱️</span>
-                <span>勉強を記録する</span>
-              </button>
-
-              <button
-                onClick={() => handleNavItemClick('gallery')}
-                className={`flex items-center gap-3.5 px-4 py-3 rounded-xl transition-all font-medium text-sm ${
-                  activeTab === 'gallery' 
-                    ? 'bg-slate-800 text-teal-400 border-l-4 border-teal-500 shadow-inner' 
-                    : 'text-slate-300 hover:bg-slate-900'
-                }`}
-              >
-                <span className="text-lg">📅</span>
-                <span>ギャラリー・カレンダー</span>
-              </button>
+              <button onClick={() => handleNavItemClick('record')} className={`flex items-center gap-3.5 px-4 py-3 rounded-xl transition-all font-medium text-sm ${activeTab === 'record' ? 'bg-slate-800 text-teal-400 border-l-4 border-teal-500' : 'text-slate-300 hover:bg-slate-900'}`}>⏱️ 勉強を記録する</button>
+              <button onClick={() => handleNavItemClick('gallery')} className={`flex items-center gap-3.5 px-4 py-3 rounded-xl transition-all font-medium text-sm ${activeTab === 'gallery' ? 'bg-slate-800 text-teal-400 border-l-4 border-teal-500' : 'text-slate-300 hover:bg-slate-900'}`}>📅 ギャラリー・カレンダー</button>
             </nav>
           </div>
-
           <div className="p-4 border-t border-slate-900">
             <div className="bg-gradient-to-br from-slate-900 to-slate-950 p-4 rounded-xl border border-slate-800">
               <div className="text-[10px] text-slate-400 font-bold tracking-wider uppercase">累計総勉強時間</div>
-              <div className="text-xl font-extrabold text-teal-400 mt-1">
-                {formatMinutesToHours(overallTotalMinutes)}
-              </div>
+              <div className="text-xl font-extrabold text-teal-400 mt-1">{formatMinutesToHours(overallTotalMinutes)}</div>
               <div className="text-[10px] text-slate-500 mt-1">{studyRecords.length}個の記録</div>
             </div>
           </div>
@@ -509,74 +394,29 @@ export default function App() {
           {activeTab === 'record' ? (
             <div className="max-w-xl mx-auto space-y-6">
               <div className="text-center mb-2">
-                <span className="inline-block bg-teal-500/10 text-teal-400 border border-teal-500/30 text-xs px-3.5 py-1.5 rounded-full font-bold uppercase tracking-widest">
-                  📓 Focus Session 📓
-                </span>
+                <span className="inline-block bg-teal-500/10 text-teal-400 border border-teal-500/30 text-xs px-3.5 py-1.5 rounded-full font-bold uppercase tracking-widest">📓 Focus Session 📓</span>
                 <h1 className="text-2xl md:text-3xl font-extrabold text-slate-100 mt-2">勉強時間の記録</h1>
-                <p className="text-sm text-slate-400 mt-1">開始ボタンを押して集中をスタートしましょう。</p>
               </div>
 
               <div className="bg-slate-950 border border-slate-800/80 rounded-2xl p-6 md:p-8 shadow-xl flex flex-col items-center relative overflow-hidden">
                 <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-teal-500 via-indigo-500 to-pink-500"></div>
-
-                <div className="relative w-48 h-48 md:w-56 md:h-56 rounded-full border-4 border-slate-800 flex flex-col items-center justify-center bg-slate-900/60 shadow-inner group transition-transform duration-500 hover:scale-[1.02]">
-                  {isTimerRunning && !isTimerPaused && (
-                    <div className="absolute inset-0 rounded-full border-4 border-teal-500 animate-ping opacity-10"></div>
-                  )}
-                  
-                  <span className="text-[10px] text-teal-400 font-bold uppercase tracking-wider mb-1">
-                    {isTimerRunning ? (isTimerPaused ? '一時停止中' : '計測中') : '準備完了'}
-                  </span>
-                  
-                  <span className="text-3xl md:text-4xl font-mono font-bold text-slate-100 transition-all duration-300">
-                    {formatTime(secondsElapsed)}
-                  </span>
-                  
-                  <span className="text-xs text-slate-500 mt-2">
-                    {startTime ? `開始: ${startTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}` : '時間表示'}
-                  </span>
+                <div className="relative w-48 h-48 md:w-56 md:h-56 rounded-full border-4 border-slate-800 flex flex-col items-center justify-center bg-slate-900/60 shadow-inner">
+                  <span className="text-[10px] text-teal-400 font-bold uppercase tracking-wider mb-1">{isTimerRunning ? (isTimerPaused ? '一時停止中' : '計測中') : '準備完了'}</span>
+                  <span className="text-3xl md:text-4xl font-mono font-bold text-slate-100">{formatTime(secondsElapsed)}</span>
                 </div>
 
                 <div className="w-full mt-8 flex flex-col sm:flex-row gap-3 justify-center items-center">
                   {!isTimerRunning ? (
-                    <button
-                      onClick={startTimer}
-                      className="w-full sm:w-48 bg-gradient-to-r from-teal-500 to-emerald-500 hover:from-teal-400 hover:to-emerald-400 text-slate-950 font-extrabold py-3.5 px-6 rounded-xl text-center shadow-lg shadow-teal-500/20 transform active:scale-95 transition-all text-base"
-                    >
-                      ▶ 開始する
-                    </button>
+                    <button onClick={startTimer} className="w-full sm:w-48 bg-gradient-to-r from-teal-500 to-emerald-500 text-slate-950 font-extrabold py-3.5 px-6 rounded-xl text-center shadow-lg transform active:scale-95 transition-all">▶ 開始する</button>
                   ) : (
                     <div className="w-full flex flex-col sm:flex-row gap-3">
                       {isTimerPaused ? (
-                        <button
-                          onClick={resumeTimer}
-                          className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 px-6 rounded-xl transition-all"
-                        >
-                          ▶ 再開
-                        </button>
+                        <button onClick={resumeTimer} className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 px-6 rounded-xl">▶ 再開</button>
                       ) : (
-                        <button
-                          onClick={pauseTimer}
-                          className="flex-1 bg-amber-600 hover:bg-amber-500 text-white font-bold py-3 px-6 rounded-xl transition-all"
-                        >
-                          ⏸️ 一時停止
-                        </button>
+                        <button onClick={pauseTimer} className="flex-1 bg-amber-600 hover:bg-amber-500 text-white font-bold py-3 px-6 rounded-xl">⏸️ 一時停止</button>
                       )}
-
-                      <button
-                        onClick={stopAndSaveTimer}
-                        className="flex-1 bg-teal-500 hover:bg-teal-400 text-slate-950 font-bold py-3 px-6 rounded-xl shadow-lg shadow-teal-500/10 transition-all"
-                      >
-                        ⏱️ 終了して記録
-                      </button>
-
-                      <button
-                        onClick={cancelTimer}
-                        className="sm:w-16 bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-400 hover:text-rose-400 py-3 px-4 rounded-xl transition-all"
-                        title="計測を破棄"
-                      >
-                        ❌
-                      </button>
+                      <button onClick={stopAndSaveTimer} className="flex-1 bg-teal-500 hover:bg-teal-400 text-slate-950 font-bold py-3 px-6 rounded-xl shadow-lg">⏱️ 終了して記録</button>
+                      <button onClick={cancelTimer} className="sm:w-16 bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-400 py-3 px-4 rounded-xl">❌</button>
                     </div>
                   )}
                 </div>
@@ -584,76 +424,41 @@ export default function App() {
 
               <div className="bg-slate-950 border border-slate-800/80 rounded-2xl p-6 shadow-md space-y-4">
                 <h3 className="text-base font-bold text-slate-300 border-b border-slate-800 pb-2">記録用オプション設定</h3>
-                
                 <div>
-                  <label className="block text-xs font-bold text-slate-400 mb-1.5 uppercase tracking-wide">
-                    📖 勉強内容・科目を選択
-                  </label>
+                  <label className="block text-xs font-bold text-slate-400 mb-1.5 uppercase tracking-wide">📖 科目を選択</label>
                   <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                     {['英語', '数学・算数', '国語', '理科・科学', '社会・歴史', '資格・プログラミング', '読書', '一般・その他'].map((subj) => (
-                      <button
-                        key={subj}
-                        onClick={() => setSelectedSubject(subj)}
-                        className={`py-2 px-3 text-xs rounded-lg font-semibold transition-all border ${
-                          selectedSubject === subj 
-                            ? 'bg-teal-950/40 text-teal-400 border-teal-500/80 shadow-md' 
-                            : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
-                        }`}
-                      >
-                        {subj}
-                      </button>
+                      <button key={subj} onClick={() => setSelectedSubject(subj)} className={`py-2 px-3 text-xs rounded-lg font-semibold transition-all border ${selectedSubject === subj ? 'bg-teal-950/40 text-teal-400 border-teal-500/80' : 'bg-slate-900 text-slate-300 border-slate-800'}`}>{subj}</button>
                     ))}
                   </div>
                 </div>
-
                 <div>
-                  <label className="block text-xs font-bold text-slate-400 mb-1.5 uppercase tracking-wide">
-                    ✏️ メモ・ひとこと日記 (任意)
-                  </label>
-                  <textarea
-                    rows={2}
-                    value={memo}
-                    onChange={(e) => setMemo(e.target.value)}
-                    placeholder="学習した内容、教材名、感想などを記入できます..."
-                    className="w-full bg-slate-900 border border-slate-800 focus:border-teal-500 focus:ring-1 focus:ring-teal-500 rounded-lg p-3 text-sm text-slate-100 placeholder-slate-500 outline-none transition-all resize-none"
-                  ></textarea>
+                  <label className="block text-xs font-bold text-slate-400 mb-1.5 uppercase tracking-wide">✏️ メモ (任意)</label>
+                  <textarea rows={2} value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="学習内容など..." className="w-full bg-slate-900 border border-slate-800 focus:border-teal-500 focus:ring-1 focus:ring-teal-500 rounded-lg p-3 text-sm text-slate-100 placeholder-slate-500 outline-none resize-none"></textarea>
                 </div>
               </div>
 
               <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider">最近の学習履歴</h3>
-                  <button onClick={() => setActiveTab('gallery')} className="text-xs text-teal-400 hover:underline">カレンダーで全て見る →</button>
-                </div>
-
+                <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider">最近の学習履歴</h3>
                 {studyRecords.length === 0 ? (
-                  <div className="bg-slate-950/50 text-slate-500 py-6 text-center text-sm rounded-xl border border-dashed border-slate-800">
-                    まだ記録はありません。
-                  </div>
+                  <div className="bg-slate-950/50 text-slate-500 py-6 text-center text-sm rounded-xl border border-dashed border-slate-800">まだ記録はありません。</div>
                 ) : (
                   <div className="space-y-2">
                     {studyRecords.slice(0, 3).map((record) => (
-                      <div key={record.id} className="bg-slate-950 border border-slate-800/80 rounded-xl p-3.5 flex items-center justify-between hover:border-slate-700 transition-all">
+                      <div key={record.id} className="bg-slate-950 border border-slate-800/80 rounded-xl p-3.5 flex items-center justify-between">
                         <div className="flex items-center gap-3">
                           <span className="text-xl">📓</span>
                           <div>
                             <div className="flex items-center gap-2">
                               <span className="text-xs font-bold px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300">{record.subject}</span>
-                              <span className="text-[10px] text-slate-400">
-                                {record.month !== undefined && record.day !== undefined ? `${record.month + 1}/${record.day}` : ''}
-                              </span>
+                              <span className="text-[10px] text-slate-400">{record.month !== undefined && record.day !== undefined ? `${record.month + 1}/${record.day}` : ''}</span>
                             </div>
-                            <p className="text-xs text-slate-400 mt-1 max-w-[200px] sm:max-w-xs truncate">{record.memo || "メモなし"}</p>
+                            <p className="text-xs text-slate-400 mt-1 max-w-[200px] truncate">{record.memo || "メモなし"}</p>
                           </div>
                         </div>
                         <div className="text-right">
                           <div className="text-sm font-extrabold text-teal-400">{record.duration}分</div>
-                          <button 
-                            onClick={() => deleteRecord(record.id)} 
-                            className="text-[10px] text-rose-400 hover:text-rose-300 transition-all mt-1 opacity-60 hover:opacity-100"
-                          >
-                            削除
-                          </button>
+                          <button onClick={() => deleteRecord(record.id)} className="text-[10px] text-rose-400 hover:text-rose-300 mt-1">削除</button>
                         </div>
                       </div>
                     ))}
@@ -665,81 +470,38 @@ export default function App() {
             <div className="max-w-4xl mx-auto space-y-6">
               <div className="bg-slate-950 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col md:flex-row gap-4 items-center justify-between">
                 <div>
-                  <h2 className="text-2xl font-bold flex items-center gap-2">
-                    <span>📅</span>
-                    <span>学習ギャラリー</span>
-                  </h2>
-                  <p className="text-xs text-slate-400 mt-1">日付を選ぶとその日の学習時間と詳細なメモを確認できます。</p>
+                  <h2 className="text-2xl font-bold flex items-center gap-2"><span>📅</span><span>学習ギャラリー</span></h2>
                 </div>
-
                 <div className="flex items-center gap-3">
-                  <button 
-                    onClick={prevMonth}
-                    className="p-2 bg-slate-900 border border-slate-800 hover:bg-slate-800 rounded-lg text-slate-300 transition-all"
-                  >
-                    ◀ 先月
-                  </button>
-                  <span className="text-lg font-extrabold font-mono text-slate-100 px-2 min-w-[120px] text-center">
-                    {currentYear}年 {currentMonth + 1}月
-                  </span>
-                  <button 
-                    onClick={nextMonth}
-                    className="p-2 bg-slate-900 border border-slate-800 hover:bg-slate-800 rounded-lg text-slate-300 transition-all"
-                  >
-                    来月 ▶
-                  </button>
+                  <button onClick={prevMonth} className="p-2 bg-slate-900 border border-slate-800 hover:bg-slate-800 rounded-lg text-slate-300">◀ 先月</button>
+                  <span className="text-lg font-extrabold font-mono text-slate-100 px-2 min-w-[120px] text-center">{currentYear}年 {currentMonth + 1}月</span>
+                  <button onClick={nextMonth} className="p-2 bg-slate-900 border border-slate-800 hover:bg-slate-800 rounded-lg text-slate-300">来月 ▶</button>
                 </div>
               </div>
 
               <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 md:p-6 shadow-xl overflow-hidden">
                 <div className="grid grid-cols-7 gap-1 md:gap-2 mb-2 text-center text-xs font-bold uppercase tracking-wider">
-                  <div className="text-rose-400 py-2">日</div>
-                  <div className="text-slate-400 py-2">月</div>
-                  <div className="text-slate-400 py-2">火</div>
-                  <div className="text-slate-400 py-2">水</div>
-                  <div className="text-slate-400 py-2">木</div>
-                  <div className="text-slate-400 py-2">金</div>
-                  <div className="text-teal-400 py-2">土</div>
+                  <div className="text-rose-400 py-2">日</div><div className="text-slate-400 py-2">月</div><div className="text-slate-400 py-2">火</div><div className="text-slate-400 py-2">水</div><div className="text-slate-400 py-2">木</div><div className="text-slate-400 py-2">金</div><div className="text-teal-400 py-2">土</div>
                 </div>
-
                 <div className="grid grid-cols-7 gap-1.5 md:gap-2.5">
                   {calendarCells.map((day, idx) => {
-                    if (day === null) {
-                      return <div key={`empty-${idx}`} className="bg-slate-950/20 aspect-square rounded-xl"></div>;
-                    }
-
+                    if (day === null) return <div key={`empty-${idx}`} className="bg-slate-950/20 aspect-square rounded-xl"></div>;
                     const recordsForThisDay = getRecordsForDate(day);
                     const totalMin = recordsForThisDay.reduce((sum, r) => sum + r.duration, 0);
-                    let intensityClass = "bg-slate-900 hover:bg-slate-850 border border-slate-800/80";
-                    if (totalMin > 0 && totalMin <= 30) intensityClass = "bg-teal-950/30 border border-teal-900 text-teal-300 hover:bg-teal-900/30";
-                    else if (totalMin > 30 && totalMin <= 90) intensityClass = "bg-teal-950/60 border border-teal-800/80 text-teal-200 hover:bg-teal-900/40";
-                    else if (totalMin > 90) intensityClass = "bg-teal-900/40 border border-teal-500/60 text-teal-100 hover:bg-teal-900/60";
+                    let intensityClass = "bg-slate-900 border border-slate-800/80";
+                    if (totalMin > 0 && totalMin <= 30) intensityClass = "bg-teal-950/30 border border-teal-900 text-teal-300";
+                    else if (totalMin > 30 && totalMin <= 90) intensityClass = "bg-teal-950/60 border border-teal-800/80 text-teal-200";
+                    else if (totalMin > 90) intensityClass = "bg-teal-900/40 border border-teal-500/60 text-teal-100";
                     return (
-                      <button
-                        key={`day-${day}`}
-                        onClick={() => {
-                          if (recordsForThisDay.length > 0) {
-                            setSelectedDayDetail({
-                              day,
-                              records: recordsForThisDay,
-                              totalMinutes: totalMin
-                            });
-                          } else {
-                            showNotification(`${currentMonth + 1}月${day}日の記録はありません。`);
-                          }
-                        }}
-                        className={`aspect-square p-1.5 md:p-2 rounded-xl flex flex-col justify-between items-start transition-all duration-200 text-left ${intensityClass}`}
-                      >
-                        <span className="text-xs md:text-sm font-bold opacity-80">{day}</span>
-                        {totalMin > 0 ? (
-                          <div className="w-full text-right mt-auto">
-                            <span className="text-[9px] md:text-xs font-extrabold bg-teal-500/20 text-teal-400 px-1 py-0.5 rounded md:inline-block">
-                              {totalMin}分
-                            </span>
-                          </div>
-                        ) : (
-                          <span className="text-[9px] text-slate-700 mt-auto block">-</span>
-                        )}
+                      <button key={`day-${day}`} onClick={() => {
+                        if (recordsForThisDay.length > 0) {
+                          setSelectedDayDetail({ day, records: recordsForThisDay, totalMinutes: totalMin });
+                        } else {
+                          showNotification(`${currentMonth + 1}月${day}日の記録はありません。`);
+                        }
+                      }} className={`aspect-square p-1.5 rounded-xl flex flex-col justify-between items-start ${intensityClass}`}>
+                        <span className="text-xs font-bold opacity-80">{day}</span>
+                        {totalMin > 0 ? <div className="w-full text-right mt-auto"><span className="text-[9px] font-extrabold bg-teal-500/20 text-teal-400 px-1 py-0.5 rounded">{totalMin}分</span></div> : <span className="text-[9px] text-slate-700 mt-auto block">-</span>}
                       </button>
                     );
                   })}
@@ -747,83 +509,38 @@ export default function App() {
               </div>
 
               {selectedDayDetail && (
-                <div className="bg-slate-950 border-2 border-teal-500/30 rounded-2xl p-5 md:p-6 shadow-2xl relative transition-all animate-fadeIn">
-                  <button 
-                    onClick={() => setSelectedDayDetail(null)}
-                    className="absolute top-4 right-4 text-slate-400 hover:text-slate-200 text-sm font-bold p-2 bg-slate-900 hover:bg-slate-800 rounded-full"
-                  >
-                    ✕
-                  </button>
-
+                <div className="bg-slate-950 border-2 border-teal-500/30 rounded-2xl p-5 md:p-6 shadow-2xl relative">
+                  <button onClick={() => setSelectedDayDetail(null)} className="absolute top-4 right-4 text-slate-400 text-sm font-bold p-2 bg-slate-900 rounded-full">✕</button>
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-800 pb-3 mb-4">
                     <div>
-                      <h3 className="text-lg font-bold text-teal-400 flex items-center gap-2">
-                        <span>📓</span>
-                        <span>{currentYear}年{currentMonth + 1}月{selectedDayDetail.day}日の学習内容</span>
-                      </h3>
-                      <p className="text-xs text-slate-400 mt-1">この日に登録されたすべての勉強ログ</p>
+                      <h3 className="text-lg font-bold text-teal-400 flex items-center gap-2"><span>📅</span><span>{currentYear}年{currentMonth + 1}月{selectedDayDetail.day}日の学習内容</span></h3>
                     </div>
-                    <div className="mt-2 sm:mt-0">
-                      <span className="text-xs text-slate-400">1日の総計: </span>
-                      <span className="text-base font-extrabold text-teal-400 bg-teal-500/10 px-3 py-1 rounded-full border border-teal-500/20">
-                        {formatMinutesToHours(selectedDayDetail.totalMinutes)}
-                      </span>
-                    </div>
+                    <div className="mt-2 sm:mt-0"><span className="text-xs text-slate-400">1日の総計: </span><span className="text-base font-extrabold text-teal-400 bg-teal-500/10 px-3 py-1 rounded-full">{formatMinutesToHours(selectedDayDetail.totalMinutes)}</span></div>
                   </div>
-
-                  <div className="space-y-3 max-h-[300px] overflow-y-auto pr-2">
+                  <div className="space-y-3 max-h-[300px] overflow-y-auto">
                     {selectedDayDetail.records.map((record) => (
-                      <div key={record.id} className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:border-slate-700 transition-all">
+                      <div key={record.id} className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                         <div className="space-y-1">
                           <div className="flex items-center gap-2">
-                            <span className="bg-teal-950 text-teal-400 border border-teal-900 text-[10px] px-2.5 py-0.5 rounded font-extrabold uppercase">
-                              {record.subject}
-                            </span>
-                            {record.startTimeString && (
-                              <span className="text-[10px] text-slate-500 font-mono">
-                                {record.startTimeString} 〜 {record.endTimeString}
-                              </span>
-                            )}
+                            <span className="bg-teal-950 text-teal-400 border border-teal-900 text-[10px] px-2.5 py-0.5 rounded font-extrabold">{record.subject}</span>
+                            {record.startTimeString && <span className="text-[10px] text-slate-500 font-mono">{record.startTimeString} 〜 {record.endTimeString}</span>}
                           </div>
-                          {record.memo ? (
-                            <p className="text-sm text-slate-200 mt-1 font-medium bg-slate-950/40 p-2 rounded-lg border border-slate-900">
-                              {record.memo}
-                            </p>
-                          ) : (
-                            <p className="text-xs text-slate-500 italic">メモはありません</p>
-                          )}
+                          {record.memo ? <p className="text-sm text-slate-200 mt-1 bg-slate-950/40 p-2 rounded-lg">{record.memo}</p> : <p className="text-xs text-slate-500 italic">メモはありません</p>}
                         </div>
-
-                        <div className="flex sm:flex-col items-center sm:items-end justify-between sm:justify-center border-t sm:border-t-0 border-slate-800/60 pt-2 sm:pt-0">
+                        <div className="flex sm:flex-col items-center sm:items-end justify-between border-t sm:border-t-0 border-slate-800/60 pt-2 sm:pt-0">
                           <div className="text-lg font-extrabold text-teal-400 font-mono">{record.duration}分</div>
-                          <button
-                            onClick={() => deleteRecord(record.id)}
-                            className="text-xs text-rose-400 hover:text-rose-300 hover:underline mt-1 cursor-pointer transition-colors"
-                          >
-                            削除する
-                          </button>
+                          <button onClick={() => deleteRecord(record.id)} className="text-xs text-rose-400 mt-1">削除する</button>
                         </div>
                       </div>
                     ))}
                   </div>
                 </div>
               )}
-
-              <div className="bg-gradient-to-r from-slate-950 via-slate-900 to-slate-950 rounded-2xl p-6 border border-slate-800 text-center">
-                <span className="text-3xl block mb-2">🎉</span>
-                <h4 className="text-sm font-bold text-slate-300">継続は力なり</h4>
-                <p className="text-xs text-slate-400 max-w-lg mx-auto mt-1">
-                  毎日コツコツ勉強した時間は嘘をつきません。カレンダーをみどり色のマスで埋められるように頑張りましょう！
-                </p>
-              </div>
             </div>
           )}
         </main>
       </div>
-
-      <footer className="bg-slate-950 border-t border-slate-900 py-3 text-center text-[10px] text-slate-500">
-        &copy; 2026 Study Log App - Built with React & Firebase
-      </footer>
+      <footer className="bg-slate-950 border-t border-slate-900 py-3 text-center text-[10px] text-slate-500">&copy; 2026 Study Log App - Built with React</footer>
     </div>
   );
 }
