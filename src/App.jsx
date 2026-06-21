@@ -78,27 +78,33 @@ export default function App() {
     }
   };
 
-  // ==========================================
-  // AUTHENTICATION (RULE 3)
+// ==========================================
+  // AUTHENTICATION (AUTHENTICATION STATE PERSISTENCE)
   // ==========================================
   useEffect(() => {
-    const initAuth = async () => {
-      try {
-        setAuthLoading(true);
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          // デフォルトは匿名ログイン。Google連携はUIから行えます
-          await signInAnonymously(auth);
-        }
-      } catch (error) {
-        console.error("Auth init error:", error);
-        showNotification("認証の初期化に失敗しました。再読み込みしてください。", true);
-      } finally {
+    setAuthLoading(true);
+
+    // onAuthStateChangedがブラウザに保存された過去のログイン状態（Google含む）を自動で読み込みます
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      if (currentUser) {
+        // すでにログイン状態（Googleアカウント、または既存の匿名アカウント）が保存されていればそれを使います
+        setUser(currentUser);
         setAuthLoading(false);
+      } else {
+        // まだ一度もログインしていない（完全に初回訪問の）場合のみ、新しく匿名アカウントを作ります
+        try {
+          await signInAnonymously(auth);
+        } catch (error) {
+          console.error("Auth init error:", error);
+          showNotification("認証の初期化に失敗しました。再読み込みしてください。", true);
+        } finally {
+          setAuthLoading(false);
+        }
       }
-    };
-    initAuth();
+    });
+
+    return () => unsubscribe();
+  }, []);
 
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
