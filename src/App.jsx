@@ -84,14 +84,11 @@ export default function App() {
   useEffect(() => {
     setAuthLoading(true);
 
-    // onAuthStateChangedがブラウザに保存された過去のログイン状態（Google含む）を自動で読み込みます
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       if (currentUser) {
-        // すでにログイン状態（Googleアカウント、または既存の匿名アカウント）が保存されていればそれを使います
         setUser(currentUser);
         setAuthLoading(false);
       } else {
-        // まだ一度もログインしていない（完全に初回訪問の）場合のみ、新しく匿名アカウントを作ります
         try {
           await signInAnonymously(auth);
         } catch (error) {
