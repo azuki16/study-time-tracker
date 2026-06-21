@@ -103,13 +103,6 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setAuthLoading(false);
-    });
-    return () => unsubscribe();
-  }, []);
-
   // Google Login Function
   const handleGoogleLogin = async () => {
     try {
