@@ -16,8 +16,7 @@ import {
   getDoc, 
   collection, 
   addDoc, 
-  query, 
-  onSnapshot, 
+  getDocs,
   deleteDoc,
   orderBy
 } from 'firebase/firestore';
@@ -78,26 +77,57 @@ export default function App() {
     }
   };
 
+  // 💡 データを一発取得する確実な関数（セキュリティブロックを回避）
+  const fetchRecords = async (currentUser) => {
+    if (!currentUser) return;
+    try {
+      const recordsCollection = collection(db, 'artifacts', appId, 'users', currentUser.uid, 'records');
+      const snapshot = await getDocs(recordsCollection);
+      const loadedRecords = [];
+      
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        loadedRecords.push({
+          id: doc.id,
+          ...data,
+        });
+      });
+
+      // 時系列順にソート
+      loadedRecords.sort((a, b) => {
+        const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+        const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+        return timeB - timeA;
+      });
+
+      setStudyRecords(loadedRecords);
+    } catch (error) {
+      console.error("Firestore read error:", error);
+      showNotification("データの読み込みに失敗しました。再読み込みしてください。", true);
+    }
+  };
+
   // ==========================================
-  // AUTHENTICATION (AUTHENTICATION STATE PERSISTENCE)
+  // AUTHENTICATION
   // ==========================================
   useEffect(() => {
     setAuthLoading(true);
 
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       if (currentUser) {
-        // 💡 Googleユーザー、または既存の匿名ユーザーがすでにいる場合はそれを維持
         setUser(currentUser);
         setAuthLoading(false);
+        // ログイン完了後にデータを安全に取得
+        await fetchRecords(currentUser);
       } else {
-        // ログイン情報が端末に全く残っていない初回訪問時のみ、匿名ログインを行う
         try {
           const result = await signInAnonymously(auth);
           setUser(result.user);
+          await fetchRecords(result.user);
         } catch (error) {
           console.error("Auth init error:", error);
-          showNotification("認証の初期化に失敗しました。再読み込みしてください。", true);
-        } {
+          showNotification("認証の初期化に失敗しました。", true);
+        } finally {
           setAuthLoading(false);
         }
       }
@@ -113,6 +143,7 @@ export default function App() {
       const result = await signInWithPopup(auth, googleProvider);
       setUser(result.user);
       showNotification("Googleアカウントでログインしました！");
+      await fetchRecords(result.user);
     } catch (error) {
       console.error("Google login error:", error);
       showNotification("Googleログインに失敗しました。" + error.message, true);
@@ -126,51 +157,14 @@ export default function App() {
     try {
       await signOut(auth);
       setUser(null);
-      // ログアウト後は新規の匿名ログインを走らせる
       const result = await signInAnonymously(auth);
       setUser(result.user);
       showNotification("ログアウトしました（ゲストモードに移行）");
+      await fetchRecords(result.user);
     } catch (error) {
       showNotification("ログアウトに失敗しました", true);
     }
   };
-
-  // ==========================================
-  // FIRESTORE DATA FETCHING (RULE 1 & 2)
-  // ==========================================
-  useEffect(() => {
-    if (!user) {
-      setStudyRecords([]);
-      return;
-    }
-
-    const recordsCollection = collection(db, 'artifacts', appId, 'users', user.uid, 'records');
-    
-    const unsubscribe = onSnapshot(recordsCollection, (snapshot) => {
-      const loadedRecords = [];
-      snapshot.forEach((doc) => {
-        const data = doc.data();
-        loadedRecords.push({
-          id: doc.id,
-          ...data,
-        });
-      });
-
-      // 保存された時系列データ(createdAt)を基準にJS側で降順にソート
-      loadedRecords.sort((a, b) => {
-        const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-        const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-        return timeB - timeA;
-      });
-      
-      setStudyRecords(loadedRecords);
-    }, (error) => {
-      console.error("Firestore read error:", error);
-      showNotification("データの同期に失敗しました。", true);
-    });
-
-    return () => unsubscribe();
-  }, [user]);
 
   // ==========================================
   // BACKGROUND-COMPATIBLE TIMER EFFECT
@@ -259,6 +253,9 @@ export default function App() {
       setPauseStartTime(null);
       setMemo('');
       showNotification(`勉強時間を記録しました！ (${durationMinutes}分)`);
+      
+      // 保存した直後に最新状態に手動更新
+      await fetchRecords(user);
     } catch (error) {
       console.error("Save error:", error);
       showNotification("データの保存に失敗しました。", true);
@@ -287,6 +284,10 @@ export default function App() {
       const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'records', recordId);
       await deleteDoc(docRef);
       showNotification("記録を削除しました。");
+      
+      // 削除完了後に一覧を再取得
+      await fetchRecords(user);
+      
       if (selectedDayDetail) {
         const updatedList = selectedDayDetail.records.filter(r => r.id !== recordId);
         if (updatedList.length === 0) {
@@ -334,7 +335,6 @@ export default function App() {
     }
   };
 
-  // 💡 世界標準時の時差バグを防ぐため、保存された日本の日付の数値でガッチリ判定します
   const getRecordsForDate = (day) => {
     return studyRecords.filter(record => {
       return record.year === currentYear &&
