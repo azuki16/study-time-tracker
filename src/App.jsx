@@ -25,7 +25,6 @@ import {
 // ==========================================
 // FIREBASE SETUP
 // ==========================================
-// 💡 ご自身のFirebaseプロジェクトの設定値をここに貼り付けます。
 const firebaseConfig = {
   apiKey: "AIzaSyAfdChbALT2e7SO0QK07bevbYy91-h_D60",
   authDomain: "study-time-tracker-9d613.firebaseapp.com",
@@ -40,13 +39,11 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = 'study-tracker-app-id';
 
-// Google Auth Provider
 const googleProvider = new GoogleAuthProvider();
 
 export default function App() {
   // --- UI States ---
   const [activeTab, setActiveTab] = useState('record');
-  // 'record' | 'gallery'
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -58,8 +55,8 @@ export default function App() {
   const [isTimerPaused, setIsTimerPaused] = useState(false);
   const [secondsElapsed, setSecondsElapsed] = useState(0);
   const [startTime, setStartTime] = useState(null);
-  const [pauseOffset, setPauseOffset] = useState(0); // 💡 一時停止していたトータルの時間（ミリ秒）
-  const [pauseStartTime, setPauseStartTime] = useState(null); // 💡 一時停止した瞬間の絶対時刻
+  const [pauseOffset, setPauseOffset] = useState(0); 
+  const [pauseStartTime, setPauseStartTime] = useState(null); 
   const [selectedSubject, setSelectedSubject] = useState('一般・その他');
   const [memo, setMemo] = useState('');
   const timerRef = useRef(null);
@@ -67,9 +64,8 @@ export default function App() {
   // --- Data States ---
   const [studyRecords, setStudyRecords] = useState([]);
   const [currentYear, setCurrentYear] = useState(new Date().getFullYear());
-  const [currentMonth, setCurrentMonth] = useState(new Date().getMonth()); // 0-11
+  const [currentMonth, setCurrentMonth] = useState(new Date().getMonth()); 
   const [selectedDayDetail, setSelectedDayDetail] = useState(null);
-  // 日付選択時の詳細ポップアップ
 
   // --- Notification Helper ---
   const showNotification = (msg, isError = false) => {
@@ -90,15 +86,18 @@ export default function App() {
 
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       if (currentUser) {
+        // 💡 Googleユーザー、または既存の匿名ユーザーがすでにいる場合はそれを維持
         setUser(currentUser);
         setAuthLoading(false);
       } else {
+        // ログイン情報が端末に全く残っていない初回訪問時のみ、匿名ログインを行う
         try {
-          await signInAnonymously(auth);
+          const result = await signInAnonymously(auth);
+          setUser(result.user);
         } catch (error) {
           console.error("Auth init error:", error);
           showNotification("認証の初期化に失敗しました。再読み込みしてください。", true);
-        } finally {
+        } {
           setAuthLoading(false);
         }
       }
@@ -111,7 +110,8 @@ export default function App() {
   const handleGoogleLogin = async () => {
     try {
       setAuthLoading(true);
-      await signInWithPopup(auth, googleProvider);
+      const result = await signInWithPopup(auth, googleProvider);
+      setUser(result.user);
       showNotification("Googleアカウントでログインしました！");
     } catch (error) {
       console.error("Google login error:", error);
@@ -125,8 +125,10 @@ export default function App() {
   const handleLogout = async () => {
     try {
       await signOut(auth);
-      // ログアウト後は再度匿名ログイン
-      await signInAnonymously(auth);
+      setUser(null);
+      // ログアウト後は新規の匿名ログインを走らせる
+      const result = await signInAnonymously(auth);
+      setUser(result.user);
       showNotification("ログアウトしました（ゲストモードに移行）");
     } catch (error) {
       showNotification("ログアウトに失敗しました", true);
@@ -137,12 +139,13 @@ export default function App() {
   // FIRESTORE DATA FETCHING (RULE 1 & 2)
   // ==========================================
   useEffect(() => {
-    if (!user) return;
+    if (!user) {
+      setStudyRecords([]);
+      return;
+    }
 
-    // RULE 1: /artifacts/{appId}/users/{userId}/{collectionName}
     const recordsCollection = collection(db, 'artifacts', appId, 'users', user.uid, 'records');
     
-    // RULE 2: 複合クエリを避け、単純なクエリで全件取得してJS側で並び替えや集計を行います
     const unsubscribe = onSnapshot(recordsCollection, (snapshot) => {
       const loadedRecords = [];
       snapshot.forEach((doc) => {
@@ -150,13 +153,16 @@ export default function App() {
         loadedRecords.push({
           id: doc.id,
           ...data,
-          // FirestoreのTimestampオブジェクトかISO文字列かを考慮してDateに変換
-          date: data.createdAt ? new Date(data.createdAt) : new Date(),
         });
       });
 
-      // JSメモリ上で日付順（降順）にソート
-      loadedRecords.sort((a, b) => b.date - a.date);
+      // 保存された時系列データ(createdAt)を基準にJS側で降順にソート
+      loadedRecords.sort((a, b) => {
+        const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+        const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+        return timeB - timeA;
+      });
+      
       setStudyRecords(loadedRecords);
     }, (error) => {
       console.error("Firestore read error:", error);
@@ -169,13 +175,11 @@ export default function App() {
   // ==========================================
   // BACKGROUND-COMPATIBLE TIMER EFFECT
   // ==========================================
-  // 💡 スマホのスリープ対策として、絶対的な時刻の差分から秒数を計算して同期させる処理です
   useEffect(() => {
     if (isTimerRunning && !isTimerPaused) {
       timerRef.current = setInterval(() => {
         if (startTime) {
           const now = Date.now();
-          // 現在時刻から「開始した時刻」と「一時停止していた合計時間」を引いて正確な経過秒数を算出
           const totalElapsed = Math.floor((now - startTime.getTime() - pauseOffset) / 1000);
           setSecondsElapsed(totalElapsed >= 0 ? totalElapsed : 0);
         }
@@ -209,7 +213,6 @@ export default function App() {
 
   const resumeTimer = () => {
     if (pauseStartTime) {
-      // 再開時に、一時停止していた期間（ミリ秒）を計算してオフセットに累積させます
       const pausedDuration = new Date().getTime() - pauseStartTime.getTime();
       setPauseOffset((prev) => prev + pausedDuration);
     }
@@ -222,34 +225,32 @@ export default function App() {
     clearInterval(timerRef.current);
 
     const endTime = new Date();
-    const durationMinutes = Math.max(1, Math.round(secondsElapsed / 60)); // 最低1分として記録
+    const durationMinutes = Math.max(1, Math.round(secondsElapsed / 60)); 
 
-    // 保存データオブジェクト
+    const now = new Date();
     const newRecord = {
       subject: selectedSubject,
-      duration: durationMinutes, // 分単位
+      duration: durationMinutes, 
       seconds: secondsElapsed,
       memo: memo.trim(),
       startTimeString: startTime ?
         startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
       endTimeString: endTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      createdAt: new Date().toISOString(), // フィルタリングと表示のためのISO文字列
-      year: new Date().getFullYear(),
-      month: new Date().getMonth(), // 0-11
-      day: new Date().getDate(),
+      createdAt: now.toISOString(), 
+      year: now.getFullYear(),
+      month: now.getMonth(), 
+      day: now.getDate(),
     };
 
     try {
       if (!user) {
-        showNotification("ログインユーザーが見つかりません。一時的にローカルのみに保存します（保存されません）。", true);
+        showNotification("ログインユーザーが見つかりません。", true);
         return;
       }
 
-      // RULE 1 に基づき保存
       const recordsCollection = collection(db, 'artifacts', appId, 'users', user.uid, 'records');
       await addDoc(recordsCollection, newRecord);
 
-      // フォームのクリアと状態リセット
       setIsTimerRunning(false);
       setIsTimerPaused(false);
       setSecondsElapsed(0);
@@ -286,7 +287,6 @@ export default function App() {
       const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'records', recordId);
       await deleteDoc(docRef);
       showNotification("記録を削除しました。");
-      // ポップアップが開いていれば更新
       if (selectedDayDetail) {
         const updatedList = selectedDayDetail.records.filter(r => r.id !== recordId);
         if (updatedList.length === 0) {
@@ -314,7 +314,6 @@ export default function App() {
 
   const getFirstDayOfMonth = (year, month) => {
     return new Date(year, month, 1).getDay();
-    // 0 (Sun) to 6 (Sat)
   };
 
   const prevMonth = () => {
@@ -335,13 +334,12 @@ export default function App() {
     }
   };
 
-  // 特定の日付の全記録を抽出する
+  // 💡 世界標準時の時差バグを防ぐため、保存された日本の日付の数値でガッチリ判定します
   const getRecordsForDate = (day) => {
     return studyRecords.filter(record => {
-      const rDate = new Date(record.createdAt);
-      return rDate.getFullYear() === currentYear &&
-             rDate.getMonth() === currentMonth &&
-             rDate.getDate() === day;
+      return record.year === currentYear &&
+             record.month === currentMonth &&
+             record.day === day;
     });
   };
 
@@ -364,26 +362,20 @@ export default function App() {
     return mins > 0 ? `${hrs}時間${mins}分` : `${hrs}時間`;
   };
 
-  // 全期間の総勉強時間を計算
   const overallTotalMinutes = studyRecords.reduce((acc, curr) => acc + (curr.duration || 0), 0);
-  // カレンダーマスの描画用配列作成
   const daysInMonth = getDaysInMonth(currentYear, currentMonth);
   const firstDayIndex = getFirstDayOfMonth(currentYear, currentMonth);
   
   const calendarCells = [];
-  // 空白セル (前月の残り)
   for (let i = 0; i < firstDayIndex; i++) {
     calendarCells.push(null);
   }
-  // 今月の日付セル
   for (let d = 1; d <= daysInMonth; d++) {
     calendarCells.push(d);
   }
 
-  // サイドバー項目タップ時の動作
   const handleNavItemClick = (tabName) => {
     setActiveTab(tabName);
-    // モバイル幅など画面サイズを想定し、項目がタップされたらサイドバーを閉じる
     if (window.innerWidth < 1024) {
       setIsSidebarOpen(false);
     }
@@ -392,7 +384,6 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 font-sans flex flex-col selection:bg-teal-500 selection:text-white">
       
-      {/* 画面上部のトーストメッセージ */}
       {successMsg && (
         <div className="fixed top-4 right-4 z-50 bg-teal-600 text-white px-5 py-3 rounded-lg shadow-2xl flex items-center gap-2 border border-teal-400 transition-all duration-300 animate-bounce">
           <span>📓</span> {successMsg}
@@ -404,10 +395,8 @@ export default function App() {
         </div>
       )}
 
-      {/* ヘッダーエリア */}
       <header className="h-14 bg-slate-950 border-b border-slate-800 flex items-center justify-between px-4 sticky top-0 z-40">
         <div className="flex items-center gap-3">
-          {/* Gemini風サイドバー開閉トグル */}
           <button 
             onClick={() => setIsSidebarOpen(!isSidebarOpen)}
             className="p-2 hover:bg-slate-800 rounded-lg text-slate-300 transition-colors focus:outline-none"
@@ -426,7 +415,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* ユーザーアカウント & ログイン情報 */}
         <div className="flex items-center gap-3 text-sm">
           {authLoading ? (
             <div className="w-4 h-4 border-2 border-teal-500 border-t-transparent rounded-full animate-spin"></div>
@@ -460,17 +448,12 @@ export default function App() {
         </div>
       </header>
 
-      {/* メインレイアウト */}
       <div className="flex flex-1 relative overflow-hidden">
-        
-        {/* スライド式サイドバー（Gemini風） */}
         <aside className={`
           absolute lg:static top-0 left-0 h-full bg-slate-950 border-r border-slate-800/80 w-64 z-30 transition-all duration-300 ease-in-out flex flex-col justify-between
           ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full lg:w-0 lg:border-r-0 lg:overflow-hidden'}
         `}>
           <div className="p-4 flex flex-col gap-2">
-            
-            {/* アカウント状態表示 */}
             <div className="mb-4 p-3 bg-slate-900 rounded-xl border border-slate-800/80">
               <p className="text-xs text-slate-400 uppercase tracking-wider font-semibold">データ保存先</p>
               <div className="flex items-center gap-2 mt-1.5">
@@ -484,7 +467,6 @@ export default function App() {
               )}
             </div>
 
-            {/* ナビゲーションメニュー */}
             <nav className="flex flex-col gap-1">
               <button
                 onClick={() => handleNavItemClick('record')}
@@ -512,7 +494,6 @@ export default function App() {
             </nav>
           </div>
 
-          {/* 総勉強時間ウィジェット */}
           <div className="p-4 border-t border-slate-900">
             <div className="bg-gradient-to-br from-slate-900 to-slate-950 p-4 rounded-xl border border-slate-800">
               <div className="text-[10px] text-slate-400 font-bold tracking-wider uppercase">累計総勉強時間</div>
@@ -524,15 +505,9 @@ export default function App() {
           </div>
         </aside>
 
-        {/* メインコンテンツ表示エリア */}
         <main className="flex-1 overflow-y-auto bg-slate-900 p-4 md:p-8">
-          
           {activeTab === 'record' ? (
-            /* ==========================================
-               勉強時間記録セクション (TIMER)
-               ========================================== */
             <div className="max-w-xl mx-auto space-y-6">
-              
               <div className="text-center mb-2">
                 <span className="inline-block bg-teal-500/10 text-teal-400 border border-teal-500/30 text-xs px-3.5 py-1.5 rounded-full font-bold uppercase tracking-widest">
                   📓 Focus Session 📓
@@ -541,13 +516,10 @@ export default function App() {
                 <p className="text-sm text-slate-400 mt-1">開始ボタンを押して集中をスタートしましょう。</p>
               </div>
 
-              {/* タイマーカード */}
               <div className="bg-slate-950 border border-slate-800/80 rounded-2xl p-6 md:p-8 shadow-xl flex flex-col items-center relative overflow-hidden">
                 <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-teal-500 via-indigo-500 to-pink-500"></div>
 
-                {/* タイマーサークル */}
                 <div className="relative w-48 h-48 md:w-56 md:h-56 rounded-full border-4 border-slate-800 flex flex-col items-center justify-center bg-slate-900/60 shadow-inner group transition-transform duration-500 hover:scale-[1.02]">
-                  {/* 外周のアニメーションサークル */}
                   {isTimerRunning && !isTimerPaused && (
                     <div className="absolute inset-0 rounded-full border-4 border-teal-500 animate-ping opacity-10"></div>
                   )}
@@ -565,7 +537,6 @@ export default function App() {
                   </span>
                 </div>
 
-                {/* 各種コントロールボタン */}
                 <div className="w-full mt-8 flex flex-col sm:flex-row gap-3 justify-center items-center">
                   {!isTimerRunning ? (
                     <button
@@ -611,11 +582,9 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 記録用オプション情報（タイマー動作中でも変更可能） */}
               <div className="bg-slate-950 border border-slate-800/80 rounded-2xl p-6 shadow-md space-y-4">
                 <h3 className="text-base font-bold text-slate-300 border-b border-slate-800 pb-2">記録用オプション設定</h3>
                 
-                {/* 勉強科目タグのセレクト */}
                 <div>
                   <label className="block text-xs font-bold text-slate-400 mb-1.5 uppercase tracking-wide">
                     📖 勉強内容・科目を選択
@@ -637,7 +606,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* メモ書き */}
                 <div>
                   <label className="block text-xs font-bold text-slate-400 mb-1.5 uppercase tracking-wide">
                     ✏️ メモ・ひとこと日記 (任意)
@@ -652,7 +620,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 最近の学習レコード(ショートカット確認) */}
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider">最近の学習履歴</h3>
@@ -673,7 +640,7 @@ export default function App() {
                             <div className="flex items-center gap-2">
                               <span className="text-xs font-bold px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300">{record.subject}</span>
                               <span className="text-[10px] text-slate-400">
-                                {record.date ? `${record.date.getMonth() + 1}/${record.date.getDate()}` : ''}
+                                {record.month !== undefined && record.day !== undefined ? `${record.month + 1}/${record.day}` : ''}
                               </span>
                             </div>
                             <p className="text-xs text-slate-400 mt-1 max-w-[200px] sm:max-w-xs truncate">{record.memo || "メモなし"}</p>
@@ -693,15 +660,9 @@ export default function App() {
                   </div>
                 )}
               </div>
-
             </div>
           ) : (
-            /* ==========================================
-               ギャラリーカレンダーセクション (GALLERY)
-               ========================================== */
             <div className="max-w-4xl mx-auto space-y-6">
-              
-              {/* 月間ヘッダーとナビゲーション */}
               <div className="bg-slate-950 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col md:flex-row gap-4 items-center justify-between">
                 <div>
                   <h2 className="text-2xl font-bold flex items-center gap-2">
@@ -730,10 +691,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* カレンダーグリッド */}
               <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 md:p-6 shadow-xl overflow-hidden">
-                
-                {/* 曜日ヘッダー */}
                 <div className="grid grid-cols-7 gap-1 md:gap-2 mb-2 text-center text-xs font-bold uppercase tracking-wider">
                   <div className="text-rose-400 py-2">日</div>
                   <div className="text-slate-400 py-2">月</div>
@@ -744,17 +702,14 @@ export default function App() {
                   <div className="text-teal-400 py-2">土</div>
                 </div>
 
-                {/* 日付マス */}
                 <div className="grid grid-cols-7 gap-1.5 md:gap-2.5">
                   {calendarCells.map((day, idx) => {
                     if (day === null) {
                       return <div key={`empty-${idx}`} className="bg-slate-950/20 aspect-square rounded-xl"></div>;
                     }
 
-                    // この日の全勉強履歴
                     const recordsForThisDay = getRecordsForDate(day);
                     const totalMin = recordsForThisDay.reduce((sum, r) => sum + r.duration, 0);
-                    // 勉強時間がある日の背景カラー度合い
                     let intensityClass = "bg-slate-900 hover:bg-slate-850 border border-slate-800/80";
                     if (totalMin > 0 && totalMin <= 30) intensityClass = "bg-teal-950/30 border border-teal-900 text-teal-300 hover:bg-teal-900/30";
                     else if (totalMin > 30 && totalMin <= 90) intensityClass = "bg-teal-950/60 border border-teal-800/80 text-teal-200 hover:bg-teal-900/40";
@@ -770,7 +725,6 @@ export default function App() {
                               totalMinutes: totalMin
                             });
                           } else {
-                            // 勉強時間がない場合、新規にその日を設定して記録画面へ移る導線等
                             showNotification(`${currentMonth + 1}月${day}日の記録はありません。`);
                           }
                         }}
@@ -792,11 +746,8 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 日別の詳細履歴ポップアップ（カレンダー下部表示） */}
               {selectedDayDetail && (
                 <div className="bg-slate-950 border-2 border-teal-500/30 rounded-2xl p-5 md:p-6 shadow-2xl relative transition-all animate-fadeIn">
-                  
-                  {/* クローズボタン */}
                   <button 
                     onClick={() => setSelectedDayDetail(null)}
                     className="absolute top-4 right-4 text-slate-400 hover:text-slate-200 text-sm font-bold p-2 bg-slate-900 hover:bg-slate-800 rounded-full"
@@ -820,11 +771,9 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 該当日の記録リスト */}
                   <div className="space-y-3 max-h-[300px] overflow-y-auto pr-2">
                     {selectedDayDetail.records.map((record) => (
                       <div key={record.id} className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:border-slate-700 transition-all">
-                        
                         <div className="space-y-1">
                           <div className="flex items-center gap-2">
                             <span className="bg-teal-950 text-teal-400 border border-teal-900 text-[10px] px-2.5 py-0.5 rounded font-extrabold uppercase">
@@ -854,15 +803,12 @@ export default function App() {
                             削除する
                           </button>
                         </div>
-
                       </div>
                     ))}
                   </div>
-
                 </div>
               )}
 
-              {/* お祝いメッセージ / ガイド */}
               <div className="bg-gradient-to-r from-slate-950 via-slate-900 to-slate-950 rounded-2xl p-6 border border-slate-800 text-center">
                 <span className="text-3xl block mb-2">🎉</span>
                 <h4 className="text-sm font-bold text-slate-300">継続は力なり</h4>
@@ -870,18 +816,14 @@ export default function App() {
                   毎日コツコツ勉強した時間は嘘をつきません。カレンダーをみどり色のマスで埋められるように頑張りましょう！
                 </p>
               </div>
-
             </div>
           )}
-
         </main>
       </div>
 
-      {/* フッター */}
       <footer className="bg-slate-950 border-t border-slate-900 py-3 text-center text-[10px] text-slate-500">
         &copy; 2026 Study Log App - Built with React & Firebase
       </footer>
-
     </div>
   );
 }
