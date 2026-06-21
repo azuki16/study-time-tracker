@@ -25,11 +25,20 @@ import {
 // ==========================================
 // FIREBASE SETUP
 // ==========================================
-const firebaseConfig = JSON.parse(__firebase_config);
+// 💡 ご自身のFirebaseプロジェクトの設定値をここに貼り付けます。
+const firebaseConfig = {
+  apiKey: "AIzaSyAfdChbALT2e7SO0QK07bevbYy91-h_D60",
+  authDomain: "study-time-tracker-9d613.firebaseapp.com",
+  projectId: "study-time-tracker-9d613",
+  storageBucket: "study-time-tracker-9d613.firebasestorage.app",
+  messagingSenderId: "914541276146",
+  appId: "1:914541276146:web:562436e67274f26b09996b"
+};
+
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'study-tracker-app-id';
+const appId = 'study-tracker-app-id';
 
 // Google Auth Provider
 const googleProvider = new GoogleAuthProvider();
