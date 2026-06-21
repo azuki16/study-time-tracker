@@ -45,7 +45,8 @@ const googleProvider = new GoogleAuthProvider();
 
 export default function App() {
   // --- UI States ---
-  const [activeTab, setActiveTab] = useState('record'); // 'record' | 'gallery'
+  const [activeTab, setActiveTab] = useState('record');
+  // 'record' | 'gallery'
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -57,6 +58,8 @@ export default function App() {
   const [isTimerPaused, setIsTimerPaused] = useState(false);
   const [secondsElapsed, setSecondsElapsed] = useState(0);
   const [startTime, setStartTime] = useState(null);
+  const [pauseOffset, setPauseOffset] = useState(0); // 💡 一時停止していたトータルの時間（ミリ秒）
+  const [pauseStartTime, setPauseStartTime] = useState(null); // 💡 一時停止した瞬間の絶対時刻
   const [selectedSubject, setSelectedSubject] = useState('一般・その他');
   const [memo, setMemo] = useState('');
   const timerRef = useRef(null);
@@ -65,7 +68,8 @@ export default function App() {
   const [studyRecords, setStudyRecords] = useState([]);
   const [currentYear, setCurrentYear] = useState(new Date().getFullYear());
   const [currentMonth, setCurrentMonth] = useState(new Date().getMonth()); // 0-11
-  const [selectedDayDetail, setSelectedDayDetail] = useState(null); // 日付選択時の詳細ポップアップ
+  const [selectedDayDetail, setSelectedDayDetail] = useState(null);
+  // 日付選択時の詳細ポップアップ
 
   // --- Notification Helper ---
   const showNotification = (msg, isError = false) => {
@@ -78,7 +82,7 @@ export default function App() {
     }
   };
 
-// ==========================================
+  // ==========================================
   // AUTHENTICATION (AUTHENTICATION STATE PERSISTENCE)
   // ==========================================
   useEffect(() => {
@@ -163,31 +167,54 @@ export default function App() {
   }, [user]);
 
   // ==========================================
+  // BACKGROUND-COMPATIBLE TIMER EFFECT
+  // ==========================================
+  // 💡 スマホのスリープ対策として、絶対的な時刻の差分から秒数を計算して同期させる処理です
+  useEffect(() => {
+    if (isTimerRunning && !isTimerPaused) {
+      timerRef.current = setInterval(() => {
+        if (startTime) {
+          const now = Date.now();
+          // 現在時刻から「開始した時刻」と「一時停止していた合計時間」を引いて正確な経過秒数を算出
+          const totalElapsed = Math.floor((now - startTime.getTime() - pauseOffset) / 1000);
+          setSecondsElapsed(totalElapsed >= 0 ? totalElapsed : 0);
+        }
+      }, 1000);
+    } else {
+      clearInterval(timerRef.current);
+    }
+    return () => clearInterval(timerRef.current);
+  }, [isTimerRunning, isTimerPaused, startTime, pauseOffset]);
+
+  // ==========================================
   // TIMER FUNCTIONS
   // ==========================================
   const startTimer = () => {
     if (isTimerRunning && !isTimerPaused) return;
-    
     if (!isTimerPaused) {
       setStartTime(new Date());
       setSecondsElapsed(0);
+      setPauseOffset(0);
+      setPauseStartTime(null);
     }
     setIsTimerRunning(true);
     setIsTimerPaused(false);
-
-    timerRef.current = setInterval(() => {
-      setSecondsElapsed((prev) => prev + 1);
-    }, 1000);
   };
 
   const pauseTimer = () => {
     if (!isTimerRunning) return;
-    clearInterval(timerRef.current);
+    setPauseStartTime(new Date());
     setIsTimerPaused(true);
   };
 
   const resumeTimer = () => {
-    startTimer();
+    if (pauseStartTime) {
+      // 再開時に、一時停止していた期間（ミリ秒）を計算してオフセットに累積させます
+      const pausedDuration = new Date().getTime() - pauseStartTime.getTime();
+      setPauseOffset((prev) => prev + pausedDuration);
+    }
+    setPauseStartTime(null);
+    setIsTimerPaused(false);
   };
 
   const stopAndSaveTimer = async () => {
@@ -203,7 +230,8 @@ export default function App() {
       duration: durationMinutes, // 分単位
       seconds: secondsElapsed,
       memo: memo.trim(),
-      startTimeString: startTime ? startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
+      startTimeString: startTime ?
+        startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
       endTimeString: endTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       createdAt: new Date().toISOString(), // フィルタリングと表示のためのISO文字列
       year: new Date().getFullYear(),
@@ -226,6 +254,8 @@ export default function App() {
       setIsTimerPaused(false);
       setSecondsElapsed(0);
       setStartTime(null);
+      setPauseOffset(0);
+      setPauseStartTime(null);
       setMemo('');
       showNotification(`勉強時間を記録しました！ (${durationMinutes}分)`);
     } catch (error) {
@@ -241,6 +271,8 @@ export default function App() {
       setIsTimerPaused(false);
       setSecondsElapsed(0);
       setStartTime(null);
+      setPauseOffset(0);
+      setPauseStartTime(null);
       setMemo('');
     }
   };
@@ -250,12 +282,10 @@ export default function App() {
   // ==========================================
   const deleteRecord = async (recordId) => {
     if (!confirm("この勉強記録を削除しますか？")) return;
-
     try {
       const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'records', recordId);
       await deleteDoc(docRef);
       showNotification("記録を削除しました。");
-      
       // ポップアップが開いていれば更新
       if (selectedDayDetail) {
         const updatedList = selectedDayDetail.records.filter(r => r.id !== recordId);
@@ -283,7 +313,8 @@ export default function App() {
   };
 
   const getFirstDayOfMonth = (year, month) => {
-    return new Date(year, month, 1).getDay(); // 0 (Sun) to 6 (Sat)
+    return new Date(year, month, 1).getDay();
+    // 0 (Sun) to 6 (Sat)
   };
 
   const prevMonth = () => {
@@ -335,7 +366,6 @@ export default function App() {
 
   // 全期間の総勉強時間を計算
   const overallTotalMinutes = studyRecords.reduce((acc, curr) => acc + (curr.duration || 0), 0);
-
   // カレンダーマスの描画用配列作成
   const daysInMonth = getDaysInMonth(currentYear, currentMonth);
   const firstDayIndex = getFirstDayOfMonth(currentYear, currentMonth);
@@ -724,13 +754,11 @@ export default function App() {
                     // この日の全勉強履歴
                     const recordsForThisDay = getRecordsForDate(day);
                     const totalMin = recordsForThisDay.reduce((sum, r) => sum + r.duration, 0);
-
                     // 勉強時間がある日の背景カラー度合い
                     let intensityClass = "bg-slate-900 hover:bg-slate-850 border border-slate-800/80";
                     if (totalMin > 0 && totalMin <= 30) intensityClass = "bg-teal-950/30 border border-teal-900 text-teal-300 hover:bg-teal-900/30";
                     else if (totalMin > 30 && totalMin <= 90) intensityClass = "bg-teal-950/60 border border-teal-800/80 text-teal-200 hover:bg-teal-900/40";
                     else if (totalMin > 90) intensityClass = "bg-teal-900/40 border border-teal-500/60 text-teal-100 hover:bg-teal-900/60";
-
                     return (
                       <button
                         key={`day-${day}`}
